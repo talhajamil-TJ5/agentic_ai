@@ -42,4 +42,16 @@ result: Runner = Runner.run_sync(math_agent, "why learn math for AI Agents?")
 print("\nCALLING AGENT\n")
 print(result.final_output)
 
+#Step 3: Running Agent Asynchronously
+import asyncio
+
+async def main():
+
+    result: Runner = await Runner.run(math_agent, "Tell me about recursion in programming.")
+
+    print(result.final_output)
+
+
+asyncio.run(main())
+
 
