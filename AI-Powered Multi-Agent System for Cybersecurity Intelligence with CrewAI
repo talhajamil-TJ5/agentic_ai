@@ -1,0 +1,223 @@
+import os
+import asyncio
+from dotenv import load_dotenv, find_dotenv
+from agents import Agent, Runner, AsyncOpenAI, OpenAIChatCompletionsModel, function_tool, RunContextWrapper, handoff, \
+    HandoffInputData
+from agents.extensions import handoff_filters
+from datetime import datetime
+from exa_py import Exa
+from pydantic import BaseModel, Field
+from tavily import AsyncTavilyClient
+
+
+_: bool = load_dotenv(find_dotenv())
+
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY", "")
+gemini_api_key = os.environ.get("GEMINI_API_KEY")
+exa_client = Exa(api_key=os.getenv("EXA_API_KEY"))
+
+tavily_api_key = os.environ.get("TEVELY_API_KEY")
+tavily_client = AsyncTavilyClient(api_key=tavily_api_key)
+
+# Step 1. Provider
+external_client: AsyncOpenAI = AsyncOpenAI(
+    api_key=gemini_api_key,
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+)
+
+# defining Modles
+# Step 2: Model
+llm_model: OpenAIChatCompletionsModel = OpenAIChatCompletionsModel(
+    model="gemini-2.5-flash",
+    openai_client=external_client)
+
+special_model: OpenAIChatCompletionsModel = OpenAIChatCompletionsModel(
+    model="gemini-2.5-pro",
+    openai_client=external_client)
+
+light_model: OpenAIChatCompletionsModel = OpenAIChatCompletionsModel(
+    model="gemini-2.5-flash-lite",
+    openai_client=external_client)
+
+
+# defining Functions
+# def get_weather(city: str) -> str:
+#    return f"The weather for {city} is sunny."
+
+class SearchContentRequest(BaseModel):
+    result: str | None = Field(default=None, description= "This is the result for which we need result.")
+    title: str | None = Field(default=None, description= "This is the title for which we need title.")
+    url: str | None = Field(default=None, description= "This is the url for which we need url.")
+    published_date: str | None = Field(default=None, description= "This is the published_date for which we need published date.")
+    summary: str | None = Field(default=None, description= "This is the summary for which we need summary.")
+
+
+@function_tool()
+async def fetch_cybersecurity_threats_tv(query: str) -> str:
+    print("[Tool Search for:]", query)
+    result = await tavily_client.search(query, summary=True)
+    SearchContentRequest.result = result
+    return SearchContentRequest.result
+
+
+@function_tool()
+async def fetch_latest_cves_tv():
+    result = await tavily_client.search("Latest CVEs 2023", summary=True)
+    print("Tool fetch_latest_cves_tv Search for Result: ", result, " Latest CVEs 2024 \n\n")
+    SearchContentRequest.result = result
+    return SearchContentRequest.result
+
+
+@function_tool()
+def fetch_cybersecurity_threats(query):
+    """Fetches real-time cybersecurity threats from Exa API."""
+    #query = "Latest cybersecurity threats 2023"
+    result = exa_client.search_and_contents(query, summary=True)
+    if result.results:
+        return [
+            {
+                # SearchContentRequest.title: item.title if hasattr(item, "title") else "No Title",
+                # SearchContentRequest.url: item.url if hasattr(item, "url") else "#",
+                # SearchContentRequest.published_date: item.published_date if hasattr(item, "published_date") else "Unknown Date",
+                # SearchContentRequest.summary: item.summary if hasattr(item, "summary") else "No Summary",
+                "title": item.title if hasattr(item, "title") else "No Title",
+                "url": item.url if hasattr(item, "url") else "#",
+                "published_date": item.published_date if hasattr(item, "published_date") else "Unknown Date",
+                "summary": item.summary if hasattr(item, "summary") else "No Summary",
+            }
+            for item in result.results
+        ]
+    return []
+
+
+@function_tool()
+def fetch_latest_cves():
+    result = exa_client.search_and_contents("Latest CVEs 2024", summary=True)
+    if result.results:
+        return [
+            {
+                # SearchContentRequest.title: item.title,
+                # SearchContentRequest.url: item.url,
+                # SearchContentRequest.published_date: item.published_date,
+                # SearchContentRequest.summary: item.summary,
+
+                "title": item.title,
+                "url": item.url,
+                "published_date": item.published_date,
+                "summary": item.summary,
+            }
+            for item in result.results[:5]
+        ]
+    return []
+
+
+# defining the Agents
+
+cybersecurity_writer: Agent = Agent(
+    name="CyberCecurityWriter",
+    instructions=""" Your role is Cybersecurity Report Writer.
+    Your backstory is experienced analyst in security documentation.
+    And your goal is Generate a structured cybersecurity report.
+    Summarize findings into a final report.
+    Your expected output is Comprehensive cybersecurity intelligence report. 
+     """,
+    model=llm_model,
+    tools=[]
+)
+
+
+def on_agent_cybersecurity_writer(ctx: RunContextWrapper, input_data: SearchContentRequest):
+    print(f"Transferring to agent -> cybersecurity_writer.\n\n", input_data, "\n")
+
+
+agent_incident_response_advisor: Agent = Agent(
+    name="IncidentResponseAdvisor",
+    instructions="""Your role is Incident Response Advisor. Your experty in cybersecurity defense strategies.
+    And your goal is Provide mitigation strategies for detected threats and vulnerabilities.
+    Suggest defensive actions against active threats.
+    Your expected output is List of recommended security measures.
+    """,
+    model=llm_model,
+    handoffs=[
+        handoff(agent=cybersecurity_writer,
+                input_filter=handoff_filters.remove_all_tools,
+                on_handoff=on_agent_cybersecurity_writer,
+                input_type=SearchContentRequest)
+    ]
+)
+
+
+def on_agent_incident_response_advisor(ctx: RunContextWrapper, input_data: SearchContentRequest):
+    print(f"Transferring to agent -> on_agent_incident_response_advisor. \n\n", input_data, "\n")
+
+
+agent_vulnerability_researcher: Agent = Agent(
+    name="VulnerabilityResearcher",
+    instructions=""" You are Vulnerability Researcher. Your backstory is Cybersecurity researcher specializing in vulnerability analysis. 
+    And your goal is to Identify latest software vulnerabilities and security flaws.
+    Fetch and analyze latest security vulnerabilities (CVEs).
+    List of newly discovered CVEs and their impact.
+    First call your tool fetch_latest_cves_tv do processing and handoff to other agent.
+    """,
+    model=llm_model,
+    tools=[fetch_latest_cves,
+
+           ],
+    handoffs=[handoff(agent=agent_incident_response_advisor,
+                      input_filter=handoff_filters.remove_all_tools,
+                      on_handoff=on_agent_incident_response_advisor,
+                      input_type=SearchContentRequest)]
+
+)
+
+
+def dynamic_instruction_for_agent_threat_analyst(context: RunContextWrapper, agent: Agent) -> str:
+    dynamic_date = datetime.now().strftime("%Y-%m-%d")
+    prompt = f"""You are expert in cybersecurity, tracking emerging threats, malware campaigns, and hacking incidents.
+     Your main goal Gather real-time cybersecurity threat intelligence. 
+    We follow a structured process for each deep search request.
+    1. get list of cyber security threats by using your tool named fetch_cybersecurity_threats_tv.
+    2. do pass this threats list to other agent vulnerability_researcher for vulnerability and per form deep search.
+    3. You are Cybersecurity Threat Intelligence Analyst.
+    4. Retrieve the latest cybersecurity threats and provide a structured summary.
+    5. List of recent cybersecurity threats including malware trends and cyberattacks.
+    """
+    return prompt
+
+
+def on_vulnerability_researcher_transfer(ctx: RunContextWrapper, input_data: SearchContentRequest):
+    print(f"Transferring to agent -> agent_vulnerability_researcher.\n\n", input_data, "\n")
+
+
+start_agent_threat_analyst: Agent = Agent(
+    name="Threat Analyst",
+    instructions=dynamic_instruction_for_agent_threat_analyst,
+    model=llm_model,
+    tools=[fetch_cybersecurity_threats],
+    handoffs=[
+        handoff(agent=agent_vulnerability_researcher,
+                input_filter=handoff_filters.remove_all_tools,
+                on_handoff=on_vulnerability_researcher_transfer,
+                input_type=SearchContentRequest)
+    ])
+
+
+async def call_start_agent_threat_analyst(inp: str)->str:
+    res = await Runner.run(start_agent_threat_analyst, input=inp)
+    print(res.final_output)
+    # display(Markdown(res.final_output))
+
+
+while True:
+    print("\n\n")
+    print("Ask your question, or type exit to end.")
+    print("Ask to Agent>>" )
+    prompt = input()
+
+    if prompt == "exit":
+        break
+    else:
+        asyncio.run(call_start_agent_threat_analyst(prompt))
+
+
+
